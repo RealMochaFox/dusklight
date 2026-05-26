@@ -87,10 +87,12 @@ jobs:
             platform: macos
             preset: x-macos-ci-arm64
             artifact_name: macos-appleclang-arm64
+            arch: arm64
           - name: AppleClang macOS x86_64
             platform: macos
             preset: x-macos-ci-x86_64
             artifact_name: macos-appleclang-x86_64
+            arch: x86_64
           - name: AppleClang iOS arm64
             platform: ios
             preset: x-ios-ci
@@ -136,13 +138,151 @@ jobs:
       - name: Build
         run: cmake --build --preset ${{matrix.preset}}
 
+      - name: Stage macOS build for universal merge
+        if: matrix.platform == 'macos'
+        run: |
+          set -eu
+          mkdir -p build/stage
+          cp -R build/install/Dusklight.app build/stage/
+          if [ -f build/install/debug.tar.xz ]; then
+            cp build/install/debug.tar.xz build/stage/
+          fi
+          printf '%s' "${DUSK_VERSION}" > build/stage/version.txt
+
+      - name: Upload macOS stage artifact
+        if: matrix.platform == 'macos'
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-universal-stage-${{matrix.arch}}
+          path: build/stage
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Upload artifacts
+        if: matrix.platform != 'macos'
         uses: actions/upload-artifact@v7
         with:
           name: dusklight-${{env.DUSK_VERSION}}-${{matrix.artifact_name}}
           path: |
             build/install/Dusklight.app
             build/install/debug.tar.*
+
+  package-macos-universal:
+    name: Package macOS universal binary
+    needs: build-apple
+    runs-on: macos-latest
+    steps:
+      - name: Download arm64 stage
+        uses: actions/download-artifact@v6
+        with:
+          name: macos-universal-stage-arm64
+          path: staged/arm64
+
+      - name: Download x86_64 stage
+        uses: actions/download-artifact@v6
+        with:
+          name: macos-universal-stage-x86_64
+          path: staged/x86_64
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -eu
+          arm_ver="$(cat staged/arm64/version.txt)"
+          x86_ver="$(cat staged/x86_64/version.txt)"
+          if [ "$arm_ver" != "$x86_ver" ]; then
+            echo "::error::version mismatch between arm64 ($arm_ver) and x86_64 ($x86_ver) stage artifacts"
+            exit 1
+          fi
+          echo "DUSK_VERSION=$arm_ver" >> "$GITHUB_ENV"
+          echo "version=$arm_ver" >> "$GITHUB_OUTPUT"
+
+      - name: Merge .app into universal binary
+        run: |
+          set -eu
+          ARM_APP="staged/arm64/Dusklight.app"
+          X86_APP="staged/x86_64/Dusklight.app"
+          mkdir -p out
+          rm -rf "out/Dusklight.app"
+          cp -R "$ARM_APP" "out/Dusklight.app"
+
+          # Discover every Mach-O file under the arm64 .app and lipo it with its
+          # x86_64 counterpart. This automatically handles Dusklight, optional
+          # crashpad_handler, and any bundled dylibs.
+          while IFS= read -r arm_file; do
+            rel="${arm_file#$ARM_APP/}"
+            x86_file="$X86_APP/$rel"
+            out_file="out/Dusklight.app/$rel"
+            if [ ! -f "$x86_file" ]; then
+              echo "::error::Missing x86_64 counterpart for $rel"
+              exit 1
+            fi
+            mkdir -p "$(dirname "$out_file")"
+            echo "lipo $rel"
+            lipo -create "$arm_file" "$x86_file" -output "$out_file"
+          done < <(find "$ARM_APP" -type f -exec sh -c 'file -b "$1" | grep -q "Mach-O" && printf "%s\n" "$1"' _ {} \;)
+
+      - name: Verify universal binary
+        run: |
+          set -eu
+          MAIN_BIN="out/Dusklight.app/Contents/MacOS/Dusklight"
+          info="$(lipo -info "$MAIN_BIN")"
+          echo "$info"
+          echo "$info" | grep -q "arm64"
+          echo "$info" | grep -q "x86_64"
+
+      - name: Re-sign universal bundle (ad-hoc)
+        run: |
+          set -eu
+          # lipo invalidates the linker-applied ad-hoc signature; re-sign so
+          # macOS (especially Apple Silicon) will load the binary.
+          codesign --force --deep --sign - --timestamp=none out/Dusklight.app
+          codesign --verify --deep --strict --verbose=2 out/Dusklight.app
+
+      - name: Merge dSYMs into universal debug archive
+        run: |
+          set -eu
+          ARM_TAR="staged/arm64/debug.tar.xz"
+          X86_TAR="staged/x86_64/debug.tar.xz"
+          if [ ! -f "$ARM_TAR" ] || [ ! -f "$X86_TAR" ]; then
+            echo "No per-arch debug.tar.xz found, skipping dSYM merge"
+            exit 0
+          fi
+          mkdir -p dsym/arm64 dsym/x86_64 dsym/universal
+          tar -xf "$ARM_TAR" -C dsym/arm64
+          tar -xf "$X86_TAR" -C dsym/x86_64
+          # Use arm64 dSYM bundles as the base and lipo each DWARF binary inside.
+          cp -R dsym/arm64/. dsym/universal/
+          while IFS= read -r arm_dwarf; do
+            rel="${arm_dwarf#dsym/arm64/}"
+            x86_dwarf="dsym/x86_64/$rel"
+            out_dwarf="dsym/universal/$rel"
+            if [ ! -f "$x86_dwarf" ]; then
+              echo "::warning::Missing x86_64 DWARF for $rel; keeping arm64-only"
+              continue
+            fi
+            echo "lipo $rel"
+            lipo -create "$arm_dwarf" "$x86_dwarf" -output "$out_dwarf"
+          done < <(find dsym/arm64 -type f -path '*.dSYM/Contents/Resources/DWARF/*')
+          (cd dsym/universal && tar -cJf "$GITHUB_WORKSPACE/out/debug.tar.xz" .)
+
+      - name: Upload universal artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dusklight-${{env.DUSK_VERSION}}-macos-appleclang-universal
+          path: |
+            out/Dusklight.app
+            out/debug.tar.*
+          if-no-files-found: error
+
+      - name: Delete stage artifacts
+        if: always()
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: |
+            macos-universal-stage-arm64
+            macos-universal-stage-x86_64
+          failOnError: false
 
   build-android:
     name: Build Android (${{matrix.name}})
